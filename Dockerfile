@@ -17,7 +17,12 @@ RUN pip install demucs==4.0.1 runpod soundfile librosa requests unidecode
 COPY --from=wheels /wheels /wheels
 RUN pip install --no-deps /wheels/*.whl && rm -rf /wheels
 RUN pip uninstall -y onnxruntime
-RUN pip install onnxruntime-gpu
+# onnxruntime-gpu is pinned to a CUDA 12 / cuDNN 9 build: the newest PyPI wheels need CUDA 13 libraries, which this image does not
+# have, and onnxruntime then falls back to the CPU silently (measured: 48 s of alignment on the CPU for a 4-min song)
+RUN pip install onnxruntime-gpu==1.20.1
+# fail the build if the CUDA provider of onnxruntime cannot resolve its libraries (no GPU needed to check this)
+RUN P=$(python -c "import onnxruntime, os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi', 'libonnxruntime_providers_cuda.so'))") && \
+    ldd "$P" | tee /tmp/ldd.txt && ! grep -q "not found" /tmp/ldd.txt
 # models baked into the image: a cold start downloads nothing
 RUN mkdir -p /models/torch /root/ctc_forced_aligner && python -c "import demucs.pretrained as p; p.get_model('htdemucs')" && \
     python -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/deskpai/ctc_forced_aligner/resolve/main/04ac86b67129634da93aea76e0147ef3.onnx', '/root/ctc_forced_aligner/model.onnx')"
