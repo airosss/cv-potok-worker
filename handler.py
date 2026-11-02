@@ -4,7 +4,7 @@
 input = {"audio_url": "https://…", | "audio_base64": "…",            # any format ffmpeg reads
          "crop": {"start_s": 0, "end_s": 30},                         # optional: process only this window of the audio
          "tasks": ["separate", "align"],
-         "separate": {"model": "htdemucs", "shifts": 1, "overlap": 0.25, "format": "flac", "subtype": "PCM_24|PCM_16"},
+         "separate": {"model": "htdemucs", "shifts": 1, "overlap": 0.25, "format": "flac", "subtype": "PCM_24|PCM_16", "seed": 0},
          "align": {"language": "eng", "lines": ["…", "…"], "audio": "vocals|input", "batch_size": 16},
          "upload": {"url": "https://…", "token": "…", "prefix": "part01_"},   # results POSTed here (raw body); else inline if small
          "return_inline_max_mb": 18}
@@ -217,6 +217,11 @@ def _separate(wav, d, opts):
     x, sr = sf.read(wav, dtype="float32", always_2d=True)
     mix = torch.from_numpy(x.T).unsqueeze(0).to(DEV)
     ref = mix.mean(0); mix = (mix - ref.mean()) / (ref.std() + 1e-8)
+    # demucs shifts the audio by a random offset (0…0.5 s) per shift: two runs of one song differed by −28 dB. A seed makes the
+    # offsets fixed (same quality, repeatable; a crop from 0 then matches the start of the whole song)
+    if opts.get("seed") is not None:
+        import random
+        random.seed(int(opts["seed"]))
     with torch.no_grad():
         out = demucs.apply.apply_model(model, mix, shifts=int(opts.get("shifts", 1)), overlap=float(opts.get("overlap", 0.25)),
                                        split=True, device=DEV, progress=False)[0]
@@ -243,7 +248,7 @@ def _separate(wav, d, opts):
 
     with ThreadPoolExecutor(2) as ex:
         paths = dict(ex.map(write, arrays))
-    info.update(write_s=round(time.time() - t, 2), subtype=subtype, clipped=clipped)
+    info.update(write_s=round(time.time() - t, 2), subtype=subtype, clipped=clipped, seed=opts.get("seed"), shifts=int(opts.get("shifts", 1)))
     return paths, sr, info
 
 
