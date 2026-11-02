@@ -1,7 +1,21 @@
+# Rotary helpers of BS-RoFormer, from python-audio-separator 0.48.0 (MIT, see LICENSE). Changed here: one import (an autocast
+# helper) replaced by a local shim with the same behaviour. Nothing else.
 import torch
 from rotary_embedding_torch.rotary_embedding_torch import apply_rotary_emb, rotate_half
 
-from audio_separator.separator.uvr_lib_v5.device_utils import autocast_disabled
+from contextlib import nullcontext
+
+
+def autocast_disabled(device: torch.device):
+    """Shim for audio-separator's device_utils.autocast_disabled: autocast off inside the block where PyTorch supports it
+    (CUDA, CPU), otherwise a no-op context."""
+    try:
+        is_available = getattr(torch.amp.autocast_mode, "is_autocast_available", None)
+        if device.type == "privateuseone" or (is_available is not None and not is_available(device.type)):
+            return nullcontext()
+        return torch.autocast(device_type=device.type, enabled=False)
+    except (AssertionError, RuntimeError, TypeError, ValueError):
+        return nullcontext()
 
 
 def _is_dml_device(device: torch.device) -> bool:
