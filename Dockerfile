@@ -13,7 +13,7 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 TORCH_HOME=/models/torch DEBIAN_FRONTE
 # the CUDA/cuDNN libraries of this image live in the conda env: onnxruntime's GPU provider must find them to run on the GPU
 ENV LD_LIBRARY_PATH=/opt/conda/lib:${LD_LIBRARY_PATH}
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
-RUN pip install demucs==4.0.1 runpod soundfile librosa requests unidecode
+RUN pip install demucs==4.0.1 runpod soundfile librosa soxr requests unidecode
 COPY --from=wheels /wheels /wheels
 RUN pip install --no-deps /wheels/*.whl && rm -rf /wheels
 RUN pip uninstall -y onnxruntime
@@ -34,7 +34,17 @@ RUN mkdir -p /models/torch /root/ctc_forced_aligner && python -c "import demucs.
 COPY rmvpe_arch /models/rmvpe/rmvpe_arch
 RUN python -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt', '/models/rmvpe/rmvpe.pt')" && \
     echo "6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193  /models/rmvpe/rmvpe.pt" | sha256sum -c -
+# the mel filter bank of the pitch step, computed once here: at run time librosa is not imported at all (its first call in a
+# fresh worker paid ~14 s of numba compilation)
+RUN python -c "import librosa, numpy as np; np.save('/models/rmvpe/mel_16k_1024_128_30_8000_htk.npy', librosa.filters.mel(sr=16000, n_fft=1024, n_mels=128, fmin=30, fmax=8000, htk=True))"
 COPY handler.py /handler.py
+COPY fastaudio.py /fastaudio.py
+# the librosa-free resampler must give exactly librosa's numbers (odd lengths, 44.1 / 48 / 22.05 kHz), the baked mel must be librosa's
+RUN cd / && python -c "import numpy as np, librosa; from fastaudio import resample16 as r; \
+y = np.random.default_rng(0).standard_normal(44101 * 3).astype(np.float32) * 0.1; \
+assert all(np.array_equal(r(y[:n], sr), librosa.resample(y[:n], orig_sr=sr, target_sr=16000).astype(np.float32)) for sr in (44100, 48000, 22050) for n in (len(y), len(y) - 7)); \
+assert np.array_equal(np.load('/models/rmvpe/mel_16k_1024_128_30_8000_htk.npy'), librosa.filters.mel(sr=16000, n_fft=1024, n_mels=128, fmin=30, fmax=8000, htk=True)); \
+print('resample and mel identical to librosa')"
 # last step: fail the build if any import or baked model is missing (a masked install error once shipped an image without the aligner)
 RUN python -c "import demucs, runpod, soundfile, librosa, unidecode, onnxruntime, ctc_forced_aligner, os; assert os.path.getsize('/root/ctc_forced_aligner/model.onnx') > 1e9; assert os.path.getsize('/models/rmvpe/rmvpe.pt') > 1e8; assert 'CUDAExecutionProvider' in onnxruntime.get_available_providers(); print('imports ok', onnxruntime.get_available_providers())"
 CMD ["python", "-u", "/handler.py"]
