@@ -61,8 +61,42 @@ def _load_aligner():
     return _aligner["a"]
 
 
+_rmvpe = {}
+
+
+def _load_rmvpe():
+    """RMVPE pitch network (RVC weights rmvpe.pt, 128 mels, 4 blocks, kernel (2,2), 1-layer BiGRU)."""
+    if "m" in _rmvpe:
+        return _rmvpe["m"]
+    import sys
+    from torch import nn
+    sys.path.insert(0, "/models/rmvpe")
+    from rmvpe_arch.deepunet import DeepUnet0
+    from rmvpe_arch.seq import BiGRU
+    sys.path.pop(0)
+
+    class E2E(nn.Module):
+        def __init__(s):
+            super().__init__()
+            s.unet = DeepUnet0((2, 2), 4, 5, 4, 1, 16)
+            del s.unet.tf                 # branch unused in the forward pass, absent from the weights
+            s.cnn = nn.Conv2d(16, 3, (3, 3), padding=(1, 1))
+            s.fc = nn.Sequential(BiGRU(3 * 128, 256, 1), nn.Linear(512, 360), nn.Dropout(0.25), nn.Sigmoid())
+
+        def forward(s, mel):
+            x = mel.transpose(-1, -2).unsqueeze(1)
+            x = s.cnn(s.unet(x)).transpose(1, 2).flatten(-2)
+            return s.fc(x)
+
+    m = E2E()
+    m.load_state_dict(torch.load("/models/rmvpe/rmvpe.pt", map_location="cpu", weights_only=True), strict=True)
+    _rmvpe["m"] = m.eval().to(DEV)
+    return _rmvpe["m"]
+
+
 _load_demucs("htdemucs")                       # warm start: models in memory before the first job
 ALIGN_PROVIDERS = _load_aligner().model.get_providers()
+_load_rmvpe()
 STARTUP_S = round(time.time() - _T_START, 2)
 
 
@@ -151,7 +185,25 @@ def _align(wav_path, opts):
     y, sr = sf.read(wav_path, dtype="float32", always_2d=True)
     x = librosa.resample(y.mean(1), orig_sr=sr, target_sr=16000).astype(np.float32)
     t = time.time()
-    em, _ = cfa.generate_emissions(a.model, x, batch_size=int(opts.get("batch_size", 16 if "CUDAExecutionProvider" in ALIGN_PROVIDERS else 4)))
+    # batch by GPU memory: 16 windows ran out of memory on a 20 GB card (onnxruntime "Reduce…" runtime error), 24 GB was fine;
+    # on any GPU error retry with smaller batches, then on a CPU session, and say so in the output
+    if "CUDAExecutionProvider" in ALIGN_PROVIDERS:
+        mem_gb = torch.cuda.get_device_properties(0).total_memory / 2 ** 30
+        batch = int(opts.get("batch_size", 16 if mem_gb >= 23 else (8 if mem_gb >= 15 else 4)))
+    else:
+        batch = int(opts.get("batch_size", 4))
+    em, used = None, None
+    for b in dict.fromkeys([batch, 4, 2]):
+        try:
+            em, _ = cfa.generate_emissions(a.model, x, batch_size=b)
+            used = f"gpu batch {b}" if "CUDAExecutionProvider" in ALIGN_PROVIDERS else f"cpu batch {b}"
+            break
+        except Exception as e:
+            last = repr(e)[:200]
+    if em is None:                                     # last resort: the same model on the CPU, slow but finished
+        cpu = _ort_session(a.model_path, providers=["CPUExecutionProvider"])
+        em, _ = cfa.generate_emissions(cpu, x, batch_size=4)
+        used = f"cpu fallback after: {last}"
     emissions_s = round(time.time() - t, 2)
     step = len(x) / 16000 / em.shape[0]
     lines = list(opts.get("lines", []))
@@ -190,7 +242,47 @@ def _align(wav_path, opts):
     return {"pribor": "ctc-forced-aligner (MMS)", "yazyk": lang, "shag_kadra_s": round(step, 6),
             "sdvig_zapisi_ot_lrclib_s": round(offset, 3) if diffs else None, "slov": len(all_words), "schet_soshelsya": count_ok,
             "slova": all_words, "vse_po_strokam": by_line, "po_strokam": windowed,
-            "emissions_s": emissions_s, "providers": ALIGN_PROVIDERS}
+            "emissions_s": emissions_s, "providers": ALIGN_PROVIDERS, "emissions_on": used}
+
+
+def _f0(wav_path, opts):
+    """Pitch of the (separated) voice with RMVPE, 16 kHz, hop 10 ms, chunks of 3200 frames with 200 frames of context.
+    Returns the raw decoding per frame: cents10 = weighted mean of the 9 bins around the salience peak (cents re 10 Hz,
+    f0 = 10 * 2 ** (cents10 / 1200)) and smax = the peak salience; thresholds (voicing, f0 range) stay with the caller."""
+    import librosa
+    t = time.time()
+    m = _load_rmvpe()
+    sr, hop_ms, n_fft = 16000, float(opts.get("hop_ms", 10)), 1024
+    hop = int(sr * hop_ms / 1000)
+    y, sr0 = sf.read(wav_path, dtype="float32", always_2d=True)
+    y16 = librosa.resample(y.mean(1), orig_sr=sr0, target_sr=sr).astype(np.float32)
+    mel_b = torch.from_numpy(librosa.filters.mel(sr=sr, n_fft=n_fft, n_mels=128, fmin=30, fmax=8000, htk=True)).float().to(DEV)
+    x = torch.from_numpy(y16).to(DEV)
+    spec = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=n_fft, window=torch.hann_window(n_fft, device=DEV),
+                      center=True, return_complex=True).abs()
+    mel = torch.log(torch.clamp(mel_b @ spec, min=1e-5))
+    T = mel.shape[-1]
+    kus, ctx = int(opts.get("chunk_frames", 3200)), int(opts.get("context_frames", 200))
+    sal = np.zeros((T, 360), dtype=np.float32)
+    with torch.no_grad():
+        for a0_ in range(0, T, kus):
+            b_ = min(T, a0_ + kus)
+            a0, b0 = max(0, a0_ - ctx), min(T, b_ + ctx)
+            ch = mel[:, a0:b0]
+            n = ch.shape[-1]
+            pad = 32 * ((n - 1) // 32 + 1) - n
+            if pad:
+                ch = torch.nn.functional.pad(ch, (0, pad), mode="constant")
+            out = m(ch[None])[0, :n].float().cpu().numpy()
+            sal[a0_:b_] = out[a0_ - a0:a0_ - a0 + (b_ - a0_)]
+    cm = np.pad(20 * np.arange(360) + 1997.3794084376191, (4, 4))
+    s = np.pad(sal, ((0, 0), (4, 4)))
+    cen = np.argmax(s, axis=1)
+    idx = cen[:, None] + np.arange(-4, 5)[None]
+    w = np.take_along_axis(s, idx, axis=1)
+    cents10 = (w * cm[idx]).sum(1) / np.maximum(w.sum(1), 1e-9)
+    return {"hop_s": hop / sr, "cents10": [round(float(v), 1) for v in cents10], "smax": [round(float(v), 4) for v in s.max(1)],
+            "sec": round(time.time() - t, 2)}
 
 
 def _deliver(paths, job_input, max_mb):
@@ -233,6 +325,10 @@ def handler(job):
             src = paths.get("vocals") if a.get("audio", "vocals") == "vocals" and paths.get("vocals") else wav
             res["align"] = _align(src, a)
             res["align"]["sec"] = round(time.time() - t, 2)
+        if "f0" in tasks:
+            f = inp.get("f0") or {}
+            src = paths.get("vocals") if f.get("audio", "vocals") == "vocals" and paths.get("vocals") else wav
+            res["f0"] = _f0(src, f)
     res["timing"]["total_s"] = round(time.time() - t0, 2)
     return res
 

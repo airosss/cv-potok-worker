@@ -30,7 +30,11 @@ RUN P=$(python -c "import onnxruntime, os; print(os.path.join(os.path.dirname(on
 # models baked into the image: a cold start downloads nothing
 RUN mkdir -p /models/torch /root/ctc_forced_aligner && python -c "import demucs.pretrained as p; p.get_model('htdemucs')" && \
     python -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/deskpai/ctc_forced_aligner/resolve/main/04ac86b67129634da93aea76e0147ef3.onnx', '/root/ctc_forced_aligner/model.onnx')"
+# RMVPE pitch network: architecture code from the RMVPE / RVC projects (MIT), the public RVC weights checked by checksum
+COPY rmvpe_arch /models/rmvpe/rmvpe_arch
+RUN python -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt', '/models/rmvpe/rmvpe.pt')" && \
+    echo "6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193  /models/rmvpe/rmvpe.pt" | sha256sum -c -
 COPY handler.py /handler.py
 # last step: fail the build if any import or baked model is missing (a masked install error once shipped an image without the aligner)
-RUN python -c "import demucs, runpod, soundfile, librosa, unidecode, onnxruntime, ctc_forced_aligner, os; assert os.path.getsize('/root/ctc_forced_aligner/model.onnx') > 1e9; assert 'CUDAExecutionProvider' in onnxruntime.get_available_providers(); print('imports ok', onnxruntime.get_available_providers())"
+RUN python -c "import demucs, runpod, soundfile, librosa, unidecode, onnxruntime, ctc_forced_aligner, os; assert os.path.getsize('/root/ctc_forced_aligner/model.onnx') > 1e9; assert os.path.getsize('/models/rmvpe/rmvpe.pt') > 1e8; assert 'CUDAExecutionProvider' in onnxruntime.get_available_providers(); print('imports ok', onnxruntime.get_available_providers())"
 CMD ["python", "-u", "/handler.py"]
