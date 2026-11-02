@@ -1,7 +1,7 @@
 """RunPod serverless handler: audio separation (demucs htdemucs, vocals / no_vocals) and forced alignment of known text
 (ctc-forced-aligner, MMS). Generic: the job carries the audio (URL or base64), the text, and where to put results.
 
-input = {"audio_url": "https://…", | "audio_base64": "…",            # any format ffmpeg reads
+input = {"audio_url": "https://…", | "audio_base64": "…",            # any format ffmpeg reads ("audio_bytes": size, optional)
          "crop": {"start_s": 0, "end_s": 30},                         # optional: process only this window of the audio
          "tasks": ["separate", "align"],
          "separate": {"model": "htdemucs", "shifts": 1, "overlap": 0.25, "format": "flac", "subtype": "PCM_24|PCM_16", "seed": 0},
@@ -213,15 +213,19 @@ except Exception as e:                          # a failed warm-up must not stop
 STARTUP_S = round(time.time() - _T_START, 2)
 
 
-def _fetch(url, path, parts=4, min_mb=8):
+def _fetch(url, path, parts=4, min_mb=8, size_hint=None):
     """Download; a large file in parallel byte ranges (one long-distance TCP stream is limited by its window, several are not).
-    Any doubt (no ranges, no length, a short part) → one plain stream. Returns how many streams were used."""
-    try:
-        h = requests.head(url, timeout=20, allow_redirects=True)
-        size = int(h.headers.get("content-length") or 0)
-        ranges_ok = h.ok and h.headers.get("accept-ranges", "").lower() == "bytes"
-    except Exception:
-        size, ranges_ok = 0, False
+    Any doubt (no ranges, no length, a short part) → one plain stream. Returns how many streams were used.
+    size_hint (bytes, from the caller) below the threshold skips the size question: one round trip less across the world."""
+    ses = requests.Session()                            # the plain download reuses the connection of the size question
+    size, ranges_ok = 0, False
+    if size_hint is None or int(size_hint) >= min_mb << 20:
+        try:
+            h = ses.head(url, timeout=20, allow_redirects=True)
+            size = int(h.headers.get("content-length") or 0)
+            ranges_ok = h.ok and h.headers.get("accept-ranges", "").lower() == "bytes"
+        except Exception:
+            pass
     if ranges_ok and size >= min_mb << 20:
         step = -(-size // parts)
         spans = [(a, min(size, a + step) - 1) for a in range(0, size, step)]
@@ -242,7 +246,7 @@ def _fetch(url, path, parts=4, min_mb=8):
                 return len(spans)
         except Exception:
             pass
-    with requests.get(url, stream=True, timeout=120) as r:
+    with ses.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(path, "wb") as f:
             for ch in r.iter_content(1 << 20):
@@ -255,7 +259,7 @@ def _audio(job_input, d):
     src = os.path.join(d, "input")
     info = {"streams": 1}
     if job_input.get("audio_url"):
-        info["streams"] = _fetch(job_input["audio_url"], src)
+        info["streams"] = _fetch(job_input["audio_url"], src, size_hint=job_input.get("audio_bytes"))
     elif job_input.get("audio_base64"):
         with open(src, "wb") as f:
             f.write(base64.b64decode(job_input["audio_base64"]))
