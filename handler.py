@@ -206,8 +206,12 @@ def _align(wav_path, opts):
     import librosa
     a = _load_aligner()
     lang = opts.get("language", "eng")
+    t_r = time.time()
     y, sr = sf.read(wav_path, dtype="float32", always_2d=True)
+    read_s = round(time.time() - t_r, 2)
+    t_r = time.time()
     x = librosa.resample(y.mean(1), orig_sr=sr, target_sr=16000).astype(np.float32)
+    resample_s = round(time.time() - t_r, 2)
     t = time.time()
     # batch by GPU memory: 16 windows ran out of memory on a 20 GB card (onnxruntime "Reduce…" runtime error), 24 GB was fine;
     # on any GPU error retry with smaller batches, then on a CPU session, and say so in the output
@@ -238,7 +242,9 @@ def _align(wav_path, opts):
     t_pass1 = time.time()
     all_words = _words(cfa, a.tokenizer, em, step, " ".join(l for l in lead if l), lang)
     pass1_s = round(time.time() - t_pass1, 2)
+    t_pl = time.time()
     per_line = [len(cfa.preprocess_text(l, romanize=True, language=lang, split_size="word")[1]) // 2 if l else 0 for l in lead]
+    per_line_s = round(time.time() - t_pl, 2)
     by_line, i = [], 0
     for n in per_line:
         by_line.append(all_words[i:i + n]); i += n
@@ -270,6 +276,7 @@ def _align(wav_path, opts):
             "sdvig_zapisi_ot_lrclib_s": round(offset, 3) if diffs else None, "slov": len(all_words), "schet_soshelsya": count_ok,
             "slova": all_words, "vse_po_strokam": by_line, "po_strokam": windowed,
             "emissions_s": emissions_s, "pass1_s": pass1_s, "pass2_s": round(time.time() - t_pass2, 2),
+            "read_s": read_s, "resample_s": resample_s, "per_line_s": per_line_s,
             "providers": ALIGN_PROVIDERS, "emissions_on": used}
 
 
