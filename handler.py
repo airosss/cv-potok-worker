@@ -97,6 +97,30 @@ def _load_rmvpe():
 _load_demucs("htdemucs")                       # warm start: models in memory before the first job
 ALIGN_PROVIDERS = _load_aligner().model.get_providers()
 _load_rmvpe()
+LOAD_S = round(time.time() - _T_START, 2)
+
+
+def _warm_up():
+    """One tiny pass through every model before the first job: the first GPU run pays kernel selection / session init
+    (measured: the first alignment of a fresh worker took ~16 s, the next ones ~2 s)."""
+    import ctc_forced_aligner as cfa
+    import demucs.apply
+    t = time.time()
+    x = np.random.default_rng(0).standard_normal(16000 * 4).astype(np.float32) * 0.01
+    with torch.no_grad():
+        demucs.apply.apply_model(_load_demucs("htdemucs"), torch.from_numpy(np.stack([x, x]))[None].to(DEV), shifts=1, split=True,
+                                 overlap=0.25, device=DEV, progress=False)
+    a = _load_aligner()
+    em, _ = cfa.generate_emissions(a.model, x, batch_size=4)
+    tok, _ = cfa.preprocess_text("warm up", romanize=True, language="eng", split_size="word")
+    cfa.get_alignments(em, tok, a.tokenizer)
+    return round(time.time() - t, 2)
+
+
+try:
+    WARM_S = _warm_up()
+except Exception as e:                          # a failed warm-up must not stop the worker: the first job just pays the init
+    WARM_S = f"warm-up failed: {repr(e)[:120]}"
 STARTUP_S = round(time.time() - _T_START, 2)
 
 
@@ -211,7 +235,9 @@ def _align(wav_path, opts):
     win = {"before_s": 1.5, "after_s": 0.3, "last_s": 8.0, **(opts.get("window") or {})}
     parsed = [_lead(l) for l in lines]
     lead = [p[0] if not p[2] else "" for p in parsed]
+    t_pass1 = time.time()
     all_words = _words(cfa, a.tokenizer, em, step, " ".join(l for l in lead if l), lang)
+    pass1_s = round(time.time() - t_pass1, 2)
     per_line = [len(cfa.preprocess_text(l, romanize=True, language=lang, split_size="word")[1]) // 2 if l else 0 for l in lead]
     by_line, i = [], 0
     for n in per_line:
@@ -222,6 +248,7 @@ def _align(wav_path, opts):
     diffs = [w[0]["t0"] - tt for w, tt in zip(by_line or [], times) if w and tt is not None]
     offset = float(np.median(diffs)) if diffs else 0.0
     windowed, dur = [], len(x) / 16000
+    t_pass2 = time.time()
     for k, (line, tt) in enumerate(zip(lines, times)):
         if tt is None:
             windowed.append({"n": k + 1, "slova": by_line[k] if by_line else [], "okno": None})
@@ -242,7 +269,8 @@ def _align(wav_path, opts):
     return {"pribor": "ctc-forced-aligner (MMS)", "yazyk": lang, "shag_kadra_s": round(step, 6),
             "sdvig_zapisi_ot_lrclib_s": round(offset, 3) if diffs else None, "slov": len(all_words), "schet_soshelsya": count_ok,
             "slova": all_words, "vse_po_strokam": by_line, "po_strokam": windowed,
-            "emissions_s": emissions_s, "providers": ALIGN_PROVIDERS, "emissions_on": used}
+            "emissions_s": emissions_s, "pass1_s": pass1_s, "pass2_s": round(time.time() - t_pass2, 2),
+            "providers": ALIGN_PROVIDERS, "emissions_on": used}
 
 
 def _f0(wav_path, opts):
@@ -310,7 +338,7 @@ def handler(job):
     t0 = time.time()
     inp = job.get("input") or {}
     tasks = inp.get("tasks") or ["separate", "align"]
-    res = {"device": DEV, "gpu": GPU, "startup_s": STARTUP_S, "timing": {}}
+    res = {"device": DEV, "gpu": GPU, "startup_s": STARTUP_S, "load_s": LOAD_S, "warm_s": WARM_S, "timing": {}}
     with tempfile.TemporaryDirectory() as d:
         wav, res["timing"]["download_s"] = _audio(inp, d)
         paths = {}
