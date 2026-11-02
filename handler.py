@@ -288,8 +288,15 @@ def _separate(wav, d, opts):
         model, cfg = _load_roformer(name)
         load_s = 0.0 if loaded else round(time.time() - t_load, 2)
         mix = torch.from_numpy(np.ascontiguousarray(x.T))
-        vocals = _demix_roformer(model, cfg, mix, int(opts.get("num_overlap", cfg["inference"].get("num_overlap", 4))),
-                                 int(opts.get("batch", 4)))
+        overlap = int(opts.get("num_overlap", cfg["inference"].get("num_overlap", 4)))
+        for b in dict.fromkeys([int(opts.get("batch", 4)), 1]):    # out of GPU memory on a 16 GB card → one chunk at a time
+            try:
+                vocals = _demix_roformer(model, cfg, mix, overlap, b)
+                break
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                if b == 1:
+                    raise
         no_vocals = mix - vocals
     else:
         import demucs.apply
