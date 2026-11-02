@@ -66,6 +66,66 @@ def _load_aligner():
     return _aligner["a"]
 
 
+ROFORMER = {"bs_roformer_1297": ("/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+                                 "/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.yaml")}
+_roformer = {}
+
+
+def _load_roformer(name):
+    """BS-RoFormer vocals model (viperx ep 317, public UVR weights checked by sha256 at build): (model, config)."""
+    if name not in _roformer:
+        import sys
+        sys.path.insert(0, "/models/roformer")
+        from roformer_arch.load import build
+        sys.path.pop(0)
+        m, cfg = build(*ROFORMER[name])
+        _roformer[name] = (m.to(DEV), cfg)
+    return _roformer[name]
+
+
+def _demix_roformer(model, cfg, mix, overlap, batch):
+    """Chunked inference as in ZFTurbo/Music-Source-Separation-Training (demix_track): chunks of C samples every C/overlap,
+    reflect padding of C − step at both ends, linear 10 % fades, mixed precision as in training. The window is copied per
+    chunk (the reference reused one array, so the first chunk's "no fade-in" leaked into every later chunk).
+    mix: (channels, samples) float32 on the CPU → estimate of the target stem, same shape."""
+    import torch.nn.functional as F
+    C = int(cfg["audio"]["chunk_size"])
+    step = C // overlap
+    fade, border = C // 10, C - step
+    L = mix.shape[-1]
+    padded = L > 2 * border and border > 0
+    if padded:
+        mix = F.pad(mix[None], (border, border), mode="reflect")[0]
+    total = mix.shape[-1]
+    base = torch.ones(C)
+    base[:fade] = torch.linspace(0, 1, fade)
+    base[-fade:] = torch.linspace(1, 0, fade)
+    result = torch.zeros_like(mix)
+    counter = torch.zeros_like(mix)
+    starts = list(range(0, total, step))
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16, enabled=DEV == "cuda"):
+        for b0 in range(0, len(starts), batch):
+            parts, locs = [], []
+            for i in starts[b0:b0 + batch]:
+                part = mix[:, i:i + C]
+                n = part.shape[-1]
+                if n < C:
+                    part = F.pad(part[None], (0, C - n), mode="reflect")[0] if n > C // 2 + 1 else F.pad(part, (0, C - n))
+                parts.append(part)
+                locs.append((i, n))
+            out = model(torch.stack(parts).to(DEV)).float().cpu()
+            for (i, n), y in zip(locs, out):
+                w = base.clone()
+                if i == 0:
+                    w[:fade] = 1
+                if i + step >= total:
+                    w[-fade:] = 1
+                result[:, i:i + n] += y[..., :n] * w[:n]
+                counter[:, i:i + n] += w[:n]
+    est = torch.nan_to_num(result / counter)
+    return est[..., border:-border] if padded else est
+
+
 _rmvpe = {}
 
 
@@ -112,7 +172,9 @@ def _mel_basis():
     return _rmvpe["mel"]
 
 
-_load_demucs("htdemucs")                       # warm start: models in memory before the first job
+PRELOAD = [m.strip() for m in os.environ.get("PRELOAD", "htdemucs").split(",") if m.strip()]
+for _m in PRELOAD:                              # warm start: models in memory before the first job, the rest on first use
+    _load_roformer(_m) if _m in ROFORMER else _load_demucs(_m)
 ALIGN_PROVIDERS = _load_aligner().model.get_providers()
 _load_rmvpe()
 LOAD_S = round(time.time() - _T_START, 2)
@@ -125,9 +187,14 @@ def _warm_up():
     import demucs.apply
     t = time.time()
     x = np.random.default_rng(0).standard_normal(16000 * 4).astype(np.float32) * 0.01
-    with torch.no_grad():
-        demucs.apply.apply_model(_load_demucs("htdemucs"), torch.from_numpy(np.stack([x, x]))[None].to(DEV), shifts=1, split=True,
-                                 overlap=0.25, device=DEV, progress=False)
+    for m in PRELOAD:
+        if m in ROFORMER:
+            model, cfg = _load_roformer(m)
+            _demix_roformer(model, cfg, torch.from_numpy(np.stack([x, x])).repeat(1, 3), 2, 1)
+        else:
+            with torch.no_grad():
+                demucs.apply.apply_model(_load_demucs(m), torch.from_numpy(np.stack([x, x]))[None].to(DEV), shifts=1, split=True,
+                                         overlap=0.25, device=DEV, progress=False)
     a = _load_aligner()
     em, _ = cfa.generate_emissions(a.model, x, batch_size=4)
     tok, _ = cfa.preprocess_text("warm up", romanize=True, language="eng", split_size="word")
@@ -211,26 +278,39 @@ def _separate(wav, d, opts):
     """→ ({stem: path}, sample rate, info). subtype PCM_16 / PCM_24 (default 24); integer formats get values clipped to the
     integer range first (libsndfile does not clip by itself: an over-full sample would wrap around into a click), and the
     number of clipped samples is reported."""
-    import demucs.apply
     t = time.time()
-    model = _load_demucs(opts.get("model", "htdemucs"))
+    name = opts.get("model", "htdemucs")
     x, sr = sf.read(wav, dtype="float32", always_2d=True)
-    mix = torch.from_numpy(x.T).unsqueeze(0).to(DEV)
-    ref = mix.mean(0); mix = (mix - ref.mean()) / (ref.std() + 1e-8)
-    # demucs shifts the audio by a random offset (0…0.5 s) per shift: two runs of one song differed by −28 dB. A seed makes the
-    # offsets fixed (same quality, repeatable; a crop from 0 then matches the start of the whole song)
-    if opts.get("seed") is not None:
-        import random
-        random.seed(int(opts["seed"]))
-    with torch.no_grad():
-        out = demucs.apply.apply_model(model, mix, shifts=int(opts.get("shifts", 1)), overlap=float(opts.get("overlap", 0.25)),
-                                       split=True, device=DEV, progress=False)[0]
-    out = out * (ref.std() + 1e-8) + ref.mean()
-    stems = dict(zip(model.sources, out))
-    vocals = stems["vocals"]
-    no_vocals = sum(v for k, v in stems.items() if k != "vocals")
+    loaded = name in _roformer or name in _demucs
+    t_load = time.time()
+    if name in ROFORMER:
+        # vocals model: the minus is the mix minus the vocals (minus + vocals = the mix exactly)
+        model, cfg = _load_roformer(name)
+        load_s = 0.0 if loaded else round(time.time() - t_load, 2)
+        mix = torch.from_numpy(np.ascontiguousarray(x.T))
+        vocals = _demix_roformer(model, cfg, mix, int(opts.get("num_overlap", cfg["inference"].get("num_overlap", 4))),
+                                 int(opts.get("batch", 4)))
+        no_vocals = mix - vocals
+    else:
+        import demucs.apply
+        model = _load_demucs(name)
+        load_s = 0.0 if loaded else round(time.time() - t_load, 2)
+        mix = torch.from_numpy(x.T).unsqueeze(0).to(DEV)
+        ref = mix.mean(0); mix = (mix - ref.mean()) / (ref.std() + 1e-8)
+        # demucs shifts the audio by a random offset (0…0.5 s) per shift: two runs of one song differed by −28 dB. A seed makes
+        # the offsets fixed (same quality, repeatable; a crop from 0 then matches the start of the whole song)
+        if opts.get("seed") is not None:
+            import random
+            random.seed(int(opts["seed"]))
+        with torch.no_grad():
+            out = demucs.apply.apply_model(model, mix, shifts=int(opts.get("shifts", 1)), overlap=float(opts.get("overlap", 0.25)),
+                                           split=True, device=DEV, progress=False)[0]
+        out = out * (ref.std() + 1e-8) + ref.mean()
+        stems = dict(zip(model.sources, out))
+        vocals = stems["vocals"]
+        no_vocals = sum(v for k, v in stems.items() if k != "vocals")
     arrays = {"vocals": vocals.cpu().numpy().T, "no_vocals": no_vocals.cpu().numpy().T}
-    info = {"demucs_s": round(time.time() - t, 2)}
+    info = {"model": name, "model_s": round(time.time() - t - load_s, 2), "load_s": load_s}
     t = time.time()
     fmt = opts.get("format", "flac")
     subtype = opts.get("subtype", "PCM_24") if fmt in ("flac", "wav") else None

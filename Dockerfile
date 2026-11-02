@@ -13,7 +13,7 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 TORCH_HOME=/models/torch DEBIAN_FRONTE
 # the CUDA/cuDNN libraries of this image live in the conda env: onnxruntime's GPU provider must find them to run on the GPU
 ENV LD_LIBRARY_PATH=/opt/conda/lib:${LD_LIBRARY_PATH}
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
-RUN pip install demucs==4.0.1 runpod soundfile librosa soxr requests unidecode
+RUN pip install demucs==4.0.1 runpod soundfile librosa soxr requests unidecode einops pyyaml packaging rotary-embedding-torch==0.6.5 beartype==0.18.5
 COPY --from=wheels /wheels /wheels
 RUN pip install --no-deps /wheels/*.whl && rm -rf /wheels
 RUN pip uninstall -y onnxruntime
@@ -28,12 +28,19 @@ RUN find /opt/conda \( -name "libcudart.so.12*" -o -name "libcudnn.so.9*" -o -na
 RUN P=$(python -c "import onnxruntime, os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi', 'libonnxruntime_providers_cuda.so'))") && \
     ldd "$P" | tee /tmp/ldd.txt && ! grep -q "not found" /tmp/ldd.txt
 # models baked into the image: a cold start downloads nothing
-RUN mkdir -p /models/torch /root/ctc_forced_aligner && python -c "import demucs.pretrained as p; p.get_model('htdemucs')" && \
+RUN mkdir -p /models/torch /root/ctc_forced_aligner && python -c "import demucs.pretrained as p; p.get_model('htdemucs'); p.get_model('htdemucs_ft')" && \
     python -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/deskpai/ctc_forced_aligner/resolve/main/04ac86b67129634da93aea76e0147ef3.onnx', '/root/ctc_forced_aligner/model.onnx')"
 # RMVPE pitch network: architecture code from the RMVPE / RVC projects (MIT), the public RVC weights checked by checksum
 COPY rmvpe_arch /models/rmvpe/rmvpe_arch
 RUN python -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/rmvpe.pt', '/models/rmvpe/rmvpe.pt')" && \
     echo "6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193  /models/rmvpe/rmvpe.pt" | sha256sum -c -
+# BS-RoFormer vocals model (viperx ep 317): code from python-audio-separator 0.48.0 (MIT), public UVR weights checked by checksum,
+# built and loaded on the CPU here so a wrong file or an incompatible code change fails the build, not a job
+COPY roformer_arch /models/roformer/roformer_arch
+RUN python -c "import urllib.request as u; u.urlretrieve('https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt', '/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.ckpt'); u.urlretrieve('https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml', '/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.yaml')" && \
+    printf '%s  %s\n' 5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa /models/roformer/model_bs_roformer_ep_317_sdr_12.9755.ckpt \
+                     2bfdd16c656bd9519aba757cc4f8834b7ede675eb1e00ec4772d74ae1c41af7f /models/roformer/model_bs_roformer_ep_317_sdr_12.9755.yaml | sha256sum -c - && \
+    cd /models/roformer && python -c "from roformer_arch.load import build; m, c = build('model_bs_roformer_ep_317_sdr_12.9755.ckpt', 'model_bs_roformer_ep_317_sdr_12.9755.yaml'); print('roformer ok', sum(p.numel() for p in m.parameters()))"
 # the mel filter bank of the pitch step, computed once here: at run time librosa is not imported at all (its first call in a
 # fresh worker paid ~14 s of numba compilation)
 RUN python -c "import librosa, numpy as np; np.save('/models/rmvpe/mel_16k_1024_128_30_8000_htk.npy', librosa.filters.mel(sr=16000, n_fft=1024, n_mels=128, fmin=30, fmax=8000, htk=True))"
