@@ -20,6 +20,10 @@ RUN pip uninstall -y onnxruntime
 # onnxruntime-gpu is pinned to a CUDA 12 / cuDNN 9 build: the newest PyPI wheels need CUDA 13 libraries, which this image does not
 # have, and onnxruntime then falls back to the CPU silently (measured: 48 s of alignment on the CPU for a 4-min song)
 RUN pip install onnxruntime-gpu==1.20.2
+# torch brings its own CUDA 12 / cuDNN 9 libraries inside the python packages: register their folders for the dynamic loader
+RUN find /opt/conda \( -name "libcudart.so.12*" -o -name "libcudnn.so.9*" -o -name "libcublasLt.so.12*" -o -name "libcublas.so.12*" \
+         -o -name "libcufft.so.11*" -o -name "libcurand.so.10*" -o -name "libcudnn_adv.so.9*" \) -exec dirname {} \; | sort -u \
+         > /etc/ld.so.conf.d/zz-cuda-from-python.conf && cat /etc/ld.so.conf.d/zz-cuda-from-python.conf && ldconfig
 # fail the build if the CUDA provider of onnxruntime cannot resolve its libraries (no GPU needed to check this)
 RUN P=$(python -c "import onnxruntime, os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi', 'libonnxruntime_providers_cuda.so'))") && \
     ldd "$P" | tee /tmp/ldd.txt && ! grep -q "not found" /tmp/ldd.txt
