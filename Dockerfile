@@ -1,11 +1,21 @@
 # Audio separation (demucs htdemucs) + forced alignment (ctc-forced-aligner, MMS) serverless worker for RunPod.
 # Generic worker: no keys, no project paths inside; everything job-specific comes in the job input (see handler.py).
+
+# stage 1: ctc-forced-aligner is published only as source with a C++ extension: compile a wheel here, ship it without compilers
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime AS wheels
+ENV PIP_NO_CACHE_DIR=1 DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential && rm -rf /var/lib/apt/lists/*
+RUN pip wheel --no-deps -w /wheels ctc-forced-aligner==1.0.2
+
+# stage 2: runtime
 FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-runtime
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 TORCH_HOME=/models/torch DEBIAN_FRONTEND=noninteractive
-# build-essential: ctc-forced-aligner is published only as source with a C++ extension, so pip compiles it
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 build-essential && rm -rf /var/lib/apt/lists/*
+# the CUDA/cuDNN libraries of this image live in the conda env: onnxruntime's GPU provider must find them to run on the GPU
+ENV LD_LIBRARY_PATH=/opt/conda/lib:${LD_LIBRARY_PATH}
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 && rm -rf /var/lib/apt/lists/*
 RUN pip install demucs==4.0.1 runpod soundfile librosa requests unidecode
-RUN pip install --no-deps ctc-forced-aligner==1.0.2
+COPY --from=wheels /wheels /wheels
+RUN pip install --no-deps /wheels/*.whl && rm -rf /wheels
 RUN pip uninstall -y onnxruntime
 RUN pip install onnxruntime-gpu
 # models baked into the image: a cold start downloads nothing
@@ -13,5 +23,5 @@ RUN mkdir -p /models/torch /root/ctc_forced_aligner && python -c "import demucs.
     python -c "import urllib.request; urllib.request.urlretrieve('https://huggingface.co/deskpai/ctc_forced_aligner/resolve/main/04ac86b67129634da93aea76e0147ef3.onnx', '/root/ctc_forced_aligner/model.onnx')"
 COPY handler.py /handler.py
 # last step: fail the build if any import or baked model is missing (a masked install error once shipped an image without the aligner)
-RUN python -c "import demucs, runpod, soundfile, librosa, unidecode, onnxruntime, ctc_forced_aligner, os; assert os.path.getsize('/root/ctc_forced_aligner/model.onnx') > 1e9; print('imports ok', onnxruntime.get_available_providers())"
+RUN python -c "import demucs, runpod, soundfile, librosa, unidecode, onnxruntime, ctc_forced_aligner, os; assert os.path.getsize('/root/ctc_forced_aligner/model.onnx') > 1e9; assert 'CUDAExecutionProvider' in onnxruntime.get_available_providers(); print('imports ok', onnxruntime.get_available_providers())"
 CMD ["python", "-u", "/handler.py"]
