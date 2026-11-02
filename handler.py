@@ -113,32 +113,83 @@ def _separate(wav, d, opts):
     return paths, sr
 
 
+def _words(cfa, tokenizer, em, step_s, text, lang, frame0=0):
+    """Words of the text over the emission frames em; time = (frame0 + frame) × step_s."""
+    tok, txt = cfa.preprocess_text(text, romanize=True, language=lang, split_size="word")
+    seg, sc, blank = cfa.get_alignments(em, tok, tokenizer)
+    spans = cfa.get_spans(tok, seg, blank)
+    out = []
+    for i, t_ in enumerate(txt):
+        if t_ == "<star>":
+            continue
+        s0, s1 = spans[i][0].start, spans[i][-1].end
+        score = float(sc[s0:s1].sum()) if s1 > s0 else float(sc[s0])
+        out.append({"w": t_, "t0": round((frame0 + s0) * step_s, 3), "t1": round((frame0 + s1) * step_s, 3),
+                    "score": round(score, 2), "uverennost": round(float(np.exp(score / max(1, s1 - s0 + 1))), 3)})
+    return out
+
+
+def _lead(line):
+    """Line → (lead text, backing text in parentheses, backing only?). Backing vocals are sung over the lead and break the order."""
+    import re
+    backing = " ".join(x.strip() for x in re.findall(r"\(([^)]*)\)", line) if x.strip())
+    lead = re.sub(r"\s+", " ", re.sub(r"\([^)]*\)", " ", line)).strip()
+    if not re.findall(r"\w+", lead):
+        return backing, "", True
+    return lead, backing, False
+
+
 def _align(wav_path, opts):
+    """Two passes, like a careful human: (1) the whole lead text in one go; (2) if approximate line start times are given
+    ("times", e.g. from synced lyrics), each line again inside its own window [time + global offset − before_s,
+    next time + offset + after_s]. Both results are returned; the caller picks per line (windowed wins on long breaks and
+    repeated sections, where a single pass can drift by a whole section)."""
     import ctc_forced_aligner as cfa
     import librosa
     a = _load_aligner()
+    lang = opts.get("language", "eng")
     y, sr = sf.read(wav_path, dtype="float32", always_2d=True)
     x = librosa.resample(y.mean(1), orig_sr=sr, target_sr=16000).astype(np.float32)
     t = time.time()
     em, _ = cfa.generate_emissions(a.model, x, batch_size=int(opts.get("batch_size", 16 if "CUDAExecutionProvider" in ALIGN_PROVIDERS else 4)))
     emissions_s = round(time.time() - t, 2)
-    shag = len(x) / 16000 / em.shape[0]
-    lines = [l for l in opts.get("lines", []) if l and l.strip()]
-    tok, txt = cfa.preprocess_text(" ".join(lines), romanize=True, language=opts.get("language", "eng"), split_size="word")
-    seg, sc, blank = cfa.get_alignments(em, tok, a.tokenizer)
-    spans = cfa.get_spans(tok, seg, blank)
-    words = []
-    for i, t_ in enumerate(txt):
-        if t_ == "<star>":
-            continue
-        s0, s1 = spans[i][0].start, spans[i][-1].end
-        words.append({"w": t_, "t0": round(s0 * shag, 3), "t1": round(s1 * shag, 3),
-                      "score": round(float(np.exp(float(sc[s0:s1].sum() if s1 > s0 else sc[s0]) / max(1, s1 - s0 + 1))), 3)})
-    per_line = [len(cfa.preprocess_text(l, romanize=True, language=opts.get("language", "eng"), split_size="word")[1]) // 2 for l in lines]
-    idx, i = [], 0
+    step = len(x) / 16000 / em.shape[0]
+    lines = list(opts.get("lines", []))
+    times = list(opts.get("times") or [None] * len(lines))
+    win = {"before_s": 1.5, "after_s": 0.3, "last_s": 8.0, **(opts.get("window") or {})}
+    parsed = [_lead(l) for l in lines]
+    lead = [p[0] if not p[2] else "" for p in parsed]
+    all_words = _words(cfa, a.tokenizer, em, step, " ".join(l for l in lead if l), lang)
+    per_line = [len(cfa.preprocess_text(l, romanize=True, language=lang, split_size="word")[1]) // 2 if l else 0 for l in lead]
+    by_line, i = [], 0
     for n in per_line:
-        idx.append([i, i + n]); i += n
-    return {"frame_s": round(shag, 6), "words": words, "lines": idx, "count_matches": i == len(words),
+        by_line.append(all_words[i:i + n]); i += n
+    count_ok = i == len(all_words)
+    if not count_ok:
+        by_line = None
+    diffs = [w[0]["t0"] - tt for w, tt in zip(by_line or [], times) if w and tt is not None]
+    offset = float(np.median(diffs)) if diffs else 0.0
+    windowed, dur = [], len(x) / 16000
+    for k, (line, tt) in enumerate(zip(lines, times)):
+        if tt is None:
+            windowed.append({"n": k + 1, "slova": by_line[k] if by_line else [], "okno": None})
+            continue
+        text = parsed[k][0]
+        nxt = next((v for v in times[k + 1:] if v is not None), None)
+        lo = max(0.0, tt + offset - win["before_s"])
+        hi = min(dur, (nxt + offset + win["after_s"]) if nxt is not None else tt + offset + win["last_s"])
+        hi = max(hi, min(dur, lo + 1.0))
+        k0, k1 = int(lo / step), int(hi / step)
+        try:
+            windowed.append({"n": k + 1, "slova": _words(cfa, a.tokenizer, np.ascontiguousarray(em[k0:k1]), step, text, lang, frame0=k0),
+                             "okno": [round(lo, 3), round(hi, 3)]})
+        except Exception as e:                       # window shorter than the text etc.: line without words, flagged downstream
+            windowed.append({"n": k + 1, "slova": [], "okno": [round(lo, 3), round(hi, 3)], "oshibka": repr(e)[:160]})
+    # field names follow the common alignment-file layout used downstream (slova = all words in order, vse_po_strokam = the
+    # single pass split by line, po_strokam = the windowed pass)
+    return {"pribor": "ctc-forced-aligner (MMS)", "yazyk": lang, "shag_kadra_s": round(step, 6),
+            "sdvig_zapisi_ot_lrclib_s": round(offset, 3) if diffs else None, "slov": len(all_words), "schet_soshelsya": count_ok,
+            "slova": all_words, "vse_po_strokam": by_line, "po_strokam": windowed,
             "emissions_s": emissions_s, "providers": ALIGN_PROVIDERS}
 
 

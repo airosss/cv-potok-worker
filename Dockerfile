@@ -19,7 +19,7 @@ RUN pip install --no-deps /wheels/*.whl && rm -rf /wheels
 RUN pip uninstall -y onnxruntime
 # onnxruntime-gpu is pinned to a CUDA 12 / cuDNN 9 build: the newest PyPI wheels need CUDA 13 libraries, which this image does not
 # have, and onnxruntime then falls back to the CPU silently (measured: 48 s of alignment on the CPU for a 4-min song)
-RUN pip install onnxruntime-gpu==1.20.1
+RUN pip install onnxruntime-gpu==1.20.2
 # fail the build if the CUDA provider of onnxruntime cannot resolve its libraries (no GPU needed to check this)
 RUN P=$(python -c "import onnxruntime, os; print(os.path.join(os.path.dirname(onnxruntime.__file__), 'capi', 'libonnxruntime_providers_cuda.so'))") && \
     ldd "$P" | tee /tmp/ldd.txt && ! grep -q "not found" /tmp/ldd.txt
