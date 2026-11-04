@@ -37,6 +37,11 @@ RUN python -c "import urllib.request; urllib.request.urlretrieve('https://huggin
 # BS-RoFormer vocals model (viperx ep 317): code from python-audio-separator 0.48.0 (MIT), public UVR weights checked by checksum,
 # built and loaded on the CPU here so a wrong file or an incompatible code change fails the build, not a job
 COPY roformer_arch /models/roformer/roformer_arch
+COPY modeli/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956_config.yaml /models/roformer/
+RUN python -c "import urllib.request as u; u.urlretrieve('https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt', '/models/roformer/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt')" && \
+    printf '%s  %s\n' 1de20d459332fe8869aeb01327a31df0032262706e1365114e852dc271779813 /models/roformer/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt \
+                     b35077d94861f068097cce1a5e54633c055e7dcc2613eade4e4dc7c7c9c3f48b /models/roformer/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956_config.yaml | sha256sum -c - && \
+    cd /models/roformer && python -c "from roformer_arch.load import build; m, c = build('mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt', 'mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956_config.yaml'); print('mel karaoke ok', sum(p.numel() for p in m.parameters()))"
 RUN python -c "import urllib.request as u; u.urlretrieve('https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt', '/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.ckpt'); u.urlretrieve('https://raw.githubusercontent.com/TRvlvr/application_data/main/mdx_model_data/mdx_c_configs/model_bs_roformer_ep_317_sdr_12.9755.yaml', '/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.yaml')" && \
     printf '%s  %s\n' 5b84f37e8d444c8cb30c79d77f613a41c05868ff9c9ac6c7049c00aefae115aa /models/roformer/model_bs_roformer_ep_317_sdr_12.9755.ckpt \
                      2bfdd16c656bd9519aba757cc4f8834b7ede675eb1e00ec4772d74ae1c41af7f /models/roformer/model_bs_roformer_ep_317_sdr_12.9755.yaml | sha256sum -c - && \

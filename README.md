@@ -8,6 +8,8 @@ input carries the audio (URL or base64), the text lines and, optionally, an uplo
 Separation models (`separate.model`):
 - `htdemucs` (default), `htdemucs_ft` — demucs 4; `seed` fixes the random shift offsets (repeatable output).
 - `bs_roformer_1297` — BS-RoFormer vocals model (viperx, epoch 317); the minus is the mix minus the vocals.
+- `mel_karaoke_aufr33` — Mel-Band RoFormer karaoke model (aufr33 & viperx, SDR 10.2): lead vs backing vocals. Feed it a vocal
+  stem: `vocals` = the lead voice, `no_vocals` = the backing vocals. Loaded on demand (not preloaded).
   `num_overlap` (default from its config, 4) and `batch` set speed vs. smoothness.
 
 Environment: `PRELOAD` = comma-separated separation models loaded and warmed at worker start (default `htdemucs`);

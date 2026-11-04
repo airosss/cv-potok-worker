@@ -67,7 +67,11 @@ def _load_aligner():
 
 
 ROFORMER = {"bs_roformer_1297": ("/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.ckpt",
-                                 "/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.yaml")}
+                                 "/models/roformer/model_bs_roformer_ep_317_sdr_12.9755.yaml"),
+            # lead vs backing vocals (Mel-Band RoFormer karaoke, aufr33 & viperx, SDR 10.2): on a vocal stem "vocals" = lead,
+            # "no_vocals" = everything else = backing vocals; loaded on demand only
+            "mel_karaoke_aufr33": ("/models/roformer/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
+                                   "/models/roformer/mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956_config.yaml")}
 _roformer = {}
 
 
